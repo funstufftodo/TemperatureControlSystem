@@ -4,6 +4,5 @@ import lombok.Data;
 
 @Data
 public class SetTemperaRequest {
-    private int roomNumber;
     private double temperature;
 }
