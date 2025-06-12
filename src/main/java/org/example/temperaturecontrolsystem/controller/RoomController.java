@@ -4,11 +4,13 @@ import lombok.RequiredArgsConstructor;
 import org.example.temperaturecontrolsystem.dto.CheckOutBillResponse;
 import org.example.temperaturecontrolsystem.dto.RoomStatusResponse;
 import org.example.temperaturecontrolsystem.dto.UpdateCurrentTemperatureRequest;
+import org.example.temperaturecontrolsystem.entity.RoomInfo;
 import org.example.temperaturecontrolsystem.service.RoomStateService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -16,6 +18,12 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class RoomController {
     private final RoomStateService roomStateService;
+
+    @GetMapping("/status")
+    public ResponseEntity<List<RoomInfo>> getAllRooms() {
+        List<RoomInfo> rooms = roomStateService.getAllRooms();
+        return ResponseEntity.ok(rooms);
+    }
 
     @GetMapping("/{roomId}/status")
     public ResponseEntity<?> getRoomStatus(@PathVariable int roomId) {

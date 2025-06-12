@@ -41,6 +41,9 @@ public interface RoomInfoMapper {
     @Select("SELECT * FROM room_infos WHERE room_id = #{roomNumber}")
     Optional<RoomInfo> findById(@Param("roomNumber") int roomNumber);
 
+    @Select("SELECT * FROM room_infos")
+    List<RoomInfo> findAll();
+
     /**
      * 更新指定房间的状态
      * @param roomNumber 房间号

@@ -163,4 +163,9 @@ public class RoomStateService {
 
         return DAILY_ROOM_RATE.multiply(new BigDecimal(daysToBill));
     }
+
+
+    public List<RoomInfo> getAllRooms() {
+        return roomInfoMapper.findAll();
+    }
 }
