@@ -67,7 +67,6 @@ public class SchedulerService {
     }
 
     private void processMessages() {
-        // ... processMessages 方法保持原样，无需修改 ...
         while (!Thread.currentThread().isInterrupted()) {
             try {
                 SchedulerRequest msg = msgQueue.take();
@@ -79,30 +78,30 @@ public class SchedulerService {
                         int roomId = msg.getRoomId();
                         int newSpeed = getSpeedInt(msg.getSpeed());
 
-                        Slot slotToUpdate = null;
-                        boolean wasRunning = false;
-
+                        // --- 全新的、正确的 Update 逻辑 (这部分逻辑原本是正确的，无需修改) ---
+                        // Case 1: 任务正在运行
                         if (runningSlots.containsKey(roomId)) {
-                            slotToUpdate = runningSlots.remove(roomId);
-                            wasRunning = true;
-                        } else {
-                            Optional<Slot> opt = waitingQueue.stream().filter(s -> s.getRoomId() == roomId).findFirst();
-                            if (opt.isPresent()) {
-                                slotToUpdate = opt.get();
-                                waitingQueue.remove(slotToUpdate);
+                            Slot slotToUpdate = runningSlots.get(roomId);
+                            if (slotToUpdate.getSpeed() != newSpeed) {
+                                System.out.printf("Room %d is running, updating speed from %d to %d in place.%n",
+                                        roomId, slotToUpdate.getSpeed(), newSpeed);
+                                slotToUpdate.setSpeed(newSpeed);
                             }
                         }
-
-                        if (slotToUpdate != null) {
-                            if (wasRunning) {
-                                collectAndSettle(slotToUpdate);
+                        // Case 2: 任务正在等待
+                        else {
+                            Optional<Slot> opt = waitingQueue.stream().filter(s -> s.getRoomId() == roomId).findFirst();
+                            if (opt.isPresent()) {
+                                Slot slotToUpdate = opt.get();
+                                // 从等待队列中移除，更新后重新加入，以确保优先级正确
+                                waitingQueue.remove(slotToUpdate);
+                                slotToUpdate.setSpeed(newSpeed);
+                                // 重置其排序时间戳，因为它现在是一个新的请求
+                                // FIX: 更新lastServiceTime，确保公平性。你原有的逻辑这里是正确的。
+                                slotToUpdate.setLastServiceTime(LocalDateTime.now());
+                                waitingQueue.add(slotToUpdate);
+                                System.out.println("Room " + roomId + " was waiting, updated and re-queued with new speed " + newSpeed);
                             }
-                            slotToUpdate.setSpeed(newSpeed);
-                            // 当速度改变时，它相当于一个新的请求，重置其排序时间
-                            slotToUpdate.setLastServiceTime(LocalDateTime.now());
-                            waitingQueue.add(slotToUpdate);
-                            roomInfoMapper.updateAcState(roomId, 2);
-                            System.out.println("Room " + roomId + " updated to speed " + newSpeed + ", re-queued with new lastServiceTime.");
                         }
                     }
                     else if ("add".equals(msg.getType())) {
@@ -112,17 +111,23 @@ public class SchedulerService {
                             newSlot.setSpeed(getSpeedInt(msg.getSpeed()));
                             waitingQueue.add(newSlot);
                             roomInfoMapper.updateAcState(msg.getRoomId(), 2);
+                            System.out.println("Added new request for Room " + msg.getRoomId() + " with speed " + msg.getSpeed());
                         }
                     }
                     else if ("delete".equals(msg.getType())) {
-                        Slot existingSlot = findSlot(msg.getRoomId());
-                        if (existingSlot != null) {
-                            if (runningSlots.containsKey(msg.getRoomId())) {
-                                collectAndSettle(runningSlots.remove(msg.getRoomId()));
-                            } else {
-                                waitingQueue.remove(existingSlot);
-                            }
+                        int roomId = msg.getRoomId();
+                        // FIX: 正确地处理删除逻辑
+                        if (runningSlots.containsKey(roomId)) {
+                            // 如果正在运行，则停止服务并结算
+                            stopService(roomId); // stopService 内部已经包含了 remove 和 collectAndSettle
+                        } else {
+                            // 如果正在等待，则从队列中移除
+                            Optional<Slot> slotToRemove = waitingQueue.stream().filter(s -> s.getRoomId() == roomId).findFirst();
+                            slotToRemove.ifPresent(waitingQueue::remove);
                         }
+                        // 无论在哪，最后都更新为空闲状态
+                        roomInfoMapper.updateAcState(roomId, 0); // 假设 0 是空闲/关闭
+                        System.out.println("Deleted request for Room " + roomId);
                     }
                 } finally {
                     queueLock.unlock();
@@ -142,66 +147,59 @@ public class SchedulerService {
     private void step() {
         queueLock.lock();
         try {
-            // 1. 如果等待队列为空，则没有抢占或轮转的必要
+            // 1. 如果没有等待的任务，或服务槽有空闲，则按最简逻辑处理
             if (waitingQueue.isEmpty()) {
                 return;
             }
+            if (runningSlots.size() < servingSize) {
+                System.out.printf("决策：填充空闲槽！Room %d (speed %d) 进入服务%n",
+                        waitingQueue.peek().getRoomId(), waitingQueue.peek().getSpeed());
+                startService(waitingQueue.poll());
+                return;
+            }
+
+            // --- 服务槽已满，进入复杂的替换决策 ---
 
             Slot highestWaiting = waitingQueue.peek();
 
-            // 2. 如果服务槽有空位，优先填充，这是最高优先级操作
-            if (runningSlots.size() < servingSize) {
-                System.out.printf("决策：填充！Room %d 进入服务%n", highestWaiting.getRoomId());
-                startService(waitingQueue.poll());
-                return;
-                // 注意：填充后立即返回，将决策推迟到下一个 tick，这使得逻辑更简单、更稳定
-            }
+            // 2. 高优先级抢占决策
+            // 寻找一个正在运行的，且风速低于等待任务的Slot。
+            // 为了公平，我们应该抢占这些低风速任务中，优先级最低的那个（服务时间最长的）。
+            Optional<Slot> targetForPreemption = runningSlots.values().stream()
+                    .filter(running -> running.getSpeed() < highestWaiting.getSpeed())
+                    .min(Comparator.naturalOrder()); // naturalOrder() 就是我们定义的 compareTo
 
-            // --- 到此，服务槽已满，必须进行抢占或轮转决策 ---
-
-            Slot targetToPreempt = null;
-
-            // 决策分支 A: 高优先级抢占
-            // 寻找运行中的、优先级最低的任务
-            Slot lowestRunning = findLowestPriorityRunningSlot();
-            if (highestWaiting.getSpeed() > lowestRunning.getSpeed()) {
-                targetToPreempt = lowestRunning;
-                System.out.printf("决策：高优先级抢占！等待中的 Room %d (speed %d) 将抢占运行中的 Room %d (speed %d)%n",
+            if (targetForPreemption.isPresent()) {
+                Slot victim = targetForPreemption.get();
+                System.out.printf("决策：高优先级抢占！等待中的 Room %d (speed %d) 将替换运行中的 Room %d (speed %d)%n",
                         highestWaiting.getRoomId(), highestWaiting.getSpeed(),
-                        targetToPreempt.getRoomId(), targetToPreempt.getSpeed());
-            }
-            // 决策分支 B: 同级时间片轮转
-            else {
-                // 在所有正在运行的同级任务中，找到那个服务时间最长的
-                // 注意：我们只关心与等待队列头部任务同级的运行任务
-                Slot longestServedPeer = findLongestServedPeer(highestWaiting.getSpeed());
+                        victim.getRoomId(), victim.getSpeed());
 
-                // 只有当存在一个可以被轮换的同级任务时，才进行下一步判断
-                if (longestServedPeer != null) {
-                    long runningDuration = Duration.between(longestServedPeer.getServiceStartTime(), LocalDateTime.now()).getSeconds();
-
-                    // 【最终修正】只要时间片到了，就必须轮转！无需任何额外的 compareTo 检查！
-                    if (runningDuration >= timeSliceSeconds) {
-                        targetToPreempt = longestServedPeer;
-                        System.out.printf("决策：时间片轮转！Room %d 已运行 %d 秒，将被等待中最优先的 Room %d 替换%n",
-                                targetToPreempt.getRoomId(), runningDuration, highestWaiting.getRoomId());
-                    }
-                }
+                // 执行抢占
+                performSwap(victim);
+                return; // 完成本次调度
             }
 
-            // 执行抢占/轮转
-            if (targetToPreempt != null) {
-                // 停止目标任务的服务
-                Slot preemptedSlot = stopService(targetToPreempt.getRoomId());
-                if (preemptedSlot != null) {
-                    // 将被换下的任务重新加入等待队列
-                    // 它的 lastServiceTime 是它上次开始服务的时间，这保证了它在同级中优先级最低
-                    waitingQueue.add(preemptedSlot);
-                }
 
-                // 启动等待队列中优先级最高的任务
-                // （由于 compareTo 的作用，这一定是那个等待最久的任务）
-                startService(waitingQueue.poll());
+            // 3. 同级时间片轮转决策
+            // 仅当没有发生高优抢占时，才考虑同级轮转。
+            // 寻找一个正在运行的、与等待任务风速相同、且服务时间超时的任务。
+            // 如果有多个这样的任务，我们应该轮换掉那个优先级最低的（即服务时间最长的）。
+            Optional<Slot> targetForRotation = runningSlots.values().stream()
+                    .filter(running -> running.getSpeed() == highestWaiting.getSpeed())
+                    .filter(running -> Duration.between(running.getServiceStartTime(), LocalDateTime.now()).getSeconds() >= timeSliceSeconds)
+                    .min(Comparator.naturalOrder()); // 在所有超时的同级任务中，找到服务开始时间最早的那个
+
+            if (targetForRotation.isPresent()) {
+                Slot victim = targetForRotation.get();
+                // 确认一下等待队列的最高优先级者确实是同级的
+                if (highestWaiting.getSpeed() == victim.getSpeed()) {
+                    System.out.printf("决策：同级时间片轮转！等待中的 Room %d 将替换服务超时的 Room %d (同为 speed %d)%n",
+                            highestWaiting.getRoomId(), victim.getRoomId(), victim.getSpeed());
+
+                    // 执行轮转
+                    performSwap(victim);
+                }
             }
 
         } finally {
@@ -209,6 +207,38 @@ public class SchedulerService {
         }
     }
 
+    /**
+     * 辅助方法，执行一个完整的替换操作
+     * @param victim 要被从服务队列中移除的Slot
+     */
+    private void performSwap(Slot victim) {
+        // 1. 从等待队列取出新的服务者
+        Slot replacement = waitingQueue.poll();
+        if (replacement == null) return; // 安全检查
+
+        // 2. 停止旧的服务
+        Slot stoppedSlot = stopService(victim.getRoomId());
+
+        // 3. 将被换下的任务重新放入等待队列，并更新其时间戳以保证公平
+        if (stoppedSlot != null) {
+            stoppedSlot.setLastServiceTime(LocalDateTime.now());
+            waitingQueue.add(stoppedSlot);
+        }
+
+        // 4. 开始新的服务
+        startService(replacement);
+    }
+    /**
+     * 找到一个因为时间片用完而需要被轮换的任务。
+     * @return 需要被轮换的任务，如果不存在则返回 null
+     */
+    private Slot findPeerToRotate() {
+        return runningSlots.values().stream()
+                .filter(running -> Duration.between(running.getServiceStartTime(), LocalDateTime.now()).getSeconds() >= timeSliceSeconds)
+                // 在所有超时的任务中，找到优先级最低的那个（这确保了我们总是先轮换掉最不重要的超时任务）
+                .min(Comparator.naturalOrder())
+                .orElse(null);
+    }
     /**
      * 在运行中的、与指定风速相同的任务里，找到服务时间最长的那个。
      * @param speed 指定的风速

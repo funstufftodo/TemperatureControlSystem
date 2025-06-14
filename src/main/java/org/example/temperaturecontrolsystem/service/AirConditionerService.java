@@ -61,6 +61,9 @@ public class AirConditionerService {
 
         int updatedRows = roomInfoMapper.updateAcStateIfEquals(roomNumber, STATE_OFF);
 
+        roomInfoMapper.updateSpeed(roomNumber, "medium");
+
+
         OpRecord record = new OpRecord(
                 roomNumber,
                 LocalDateTime.now(),
