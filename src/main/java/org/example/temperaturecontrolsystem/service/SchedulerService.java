@@ -78,32 +78,49 @@ public class SchedulerService {
                         int roomId = msg.getRoomId();
                         int newSpeed = getSpeedInt(msg.getSpeed());
 
-                        // --- 全新的、正确的 Update 逻辑 (这部分逻辑原本是正确的，无需修改) ---
                         // Case 1: 任务正在运行
                         if (runningSlots.containsKey(roomId)) {
-                            Slot slotToUpdate = runningSlots.get(roomId);
-                            if (slotToUpdate.getSpeed() != newSpeed) {
-                                System.out.printf("Room %d is running, updating speed from %d to %d in place.%n",
-                                        roomId, slotToUpdate.getSpeed(), newSpeed);
-                                slotToUpdate.setSpeed(newSpeed);
+                            Slot runningSlot = runningSlots.get(roomId);
+
+                            // 如果速度没变，什么都不用做
+                            if (runningSlot.getSpeed() == newSpeed) {
+                                System.out.println("Room " + roomId + " is running, speed not changed.");
+                                continue;
                             }
+
+                            System.out.printf("Room %d is running, updating speed. Stopping old service (speed %d) and starting new service (speed %d).%n",
+                                    roomId, runningSlot.getSpeed(), newSpeed);
+
+                            // 1. 停止并结算旧的服务。stopService会处理 billing 和 remove。
+                            //    这一步会使用 runningSlot 中旧的 speed (例如 2) 来正确计费。
+                            stopService(roomId);
+
+                            // 2. 创建一个新的 Slot 实例来代表新的服务请求。
+                            //    这确保了所有状态都是全新的、干净的。
+                            Slot newSlotForWaiting = new Slot();
+                            newSlotForWaiting.setRoomId(roomId);
+                            newSlotForWaiting.setSpeed(newSpeed);
+                            newSlotForWaiting.setLastServiceTime(LocalDateTime.now());
+
+                            // 3. 将这个新的服务请求放入等待队列，让调度器在下一个 tick 决定如何处理它。
+                            //    通常它会因为高优先级或有空闲槽而立即被服务。
+                            waitingQueue.add(newSlotForWaiting);
+
                         }
-                        // Case 2: 任务正在等待
+                        // Case 2: 任务正在等待 (这部分逻辑原本就是正确的，保持不变)
                         else {
                             Optional<Slot> opt = waitingQueue.stream().filter(s -> s.getRoomId() == roomId).findFirst();
                             if (opt.isPresent()) {
                                 Slot slotToUpdate = opt.get();
-                                // 从等待队列中移除，更新后重新加入，以确保优先级正确
                                 waitingQueue.remove(slotToUpdate);
                                 slotToUpdate.setSpeed(newSpeed);
-                                // 重置其排序时间戳，因为它现在是一个新的请求
-                                // FIX: 更新lastServiceTime，确保公平性。你原有的逻辑这里是正确的。
                                 slotToUpdate.setLastServiceTime(LocalDateTime.now());
                                 waitingQueue.add(slotToUpdate);
                                 System.out.println("Room " + roomId + " was waiting, updated and re-queued with new speed " + newSpeed);
                             }
                         }
                     }
+                    // ... 其他消息类型 ("add", "delete") 的逻辑保持不变 ...
                     else if ("add".equals(msg.getType())) {
                         if (findSlot(msg.getRoomId()) == null) {
                             Slot newSlot = new Slot();
@@ -116,19 +133,16 @@ public class SchedulerService {
                     }
                     else if ("delete".equals(msg.getType())) {
                         int roomId = msg.getRoomId();
-                        // FIX: 正确地处理删除逻辑
                         if (runningSlots.containsKey(roomId)) {
-                            // 如果正在运行，则停止服务并结算
-                            stopService(roomId); // stopService 内部已经包含了 remove 和 collectAndSettle
+                            stopService(roomId);
                         } else {
-                            // 如果正在等待，则从队列中移除
                             Optional<Slot> slotToRemove = waitingQueue.stream().filter(s -> s.getRoomId() == roomId).findFirst();
                             slotToRemove.ifPresent(waitingQueue::remove);
                         }
-                        // 无论在哪，最后都更新为空闲状态
-                        roomInfoMapper.updateAcState(roomId, 0); // 假设 0 是空闲/关闭
+                        roomInfoMapper.updateAcState(roomId, 0);
                         System.out.println("Deleted request for Room " + roomId);
                     }
+
                 } finally {
                     queueLock.unlock();
                 }
@@ -228,32 +242,8 @@ public class SchedulerService {
         // 4. 开始新的服务
         startService(replacement);
     }
-    /**
-     * 找到一个因为时间片用完而需要被轮换的任务。
-     * @return 需要被轮换的任务，如果不存在则返回 null
-     */
-    private Slot findPeerToRotate() {
-        return runningSlots.values().stream()
-                .filter(running -> Duration.between(running.getServiceStartTime(), LocalDateTime.now()).getSeconds() >= timeSliceSeconds)
-                // 在所有超时的任务中，找到优先级最低的那个（这确保了我们总是先轮换掉最不重要的超时任务）
-                .min(Comparator.naturalOrder())
-                .orElse(null);
-    }
-    /**
-     * 在运行中的、与指定风速相同的任务里，找到服务时间最长的那个。
-     * @param speed 指定的风速
-     * @return 服务时间最长的同级任务，如果不存在则返回 null
-     */
-    private Slot findLongestServedPeer(int speed) {
-        return runningSlots.values().stream()
-                .filter(slot -> slot.getSpeed() == speed)
-                // 按 serviceStartTime 升序排序，第一个就是服务开始时间最早的，即服务时间最长的
-                .min(java.util.Comparator.comparing(Slot::getServiceStartTime))
-                .orElse(null);
-    }
 
-    // findLowestPriorityRunningSlot, startService, stopService 等其他方法保持不变
-    // startService, stopService, 和其他所有辅助方法都保持上一版的样子，它们是正确的。
+
     private void startService(Slot slot) {
         if (slot == null) return;
         LocalDateTime now = LocalDateTime.now();
@@ -308,11 +298,6 @@ public class SchedulerService {
         schedulerMapper.insertRecord(record);
     }
 
-    // --- 辅助方法保持不变 ---
-
-    private Slot findLowestPriorityRunningSlot() {
-        return runningSlots.values().stream().min(Slot::compareTo).orElse(null);
-    }
 
     private Slot findSlot(int roomId) {
         if (runningSlots.containsKey(roomId)) {
