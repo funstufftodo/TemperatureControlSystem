@@ -39,6 +39,8 @@ public class AirConditionerService {
 
         int updatedRows = roomInfoMapper.updateAcStateIfEquals(roomNumber, STATE_ON);
 
+        String currentSpeed = room.getCurrentSpeed();
+
         OpRecord record = new OpRecord(
                 roomNumber,
                 LocalDateTime.now(),
@@ -47,7 +49,7 @@ public class AirConditionerService {
                 "AC_STATE_ON"
         );
         opRecordMapper.insert(record);
-        schedulerService.submitMsg(new SchedulerRequest(roomNumber, "add", "medium"));
+        schedulerService.submitMsg(new SchedulerRequest(roomNumber, "add", currentSpeed));
     }
 
     @Transactional
