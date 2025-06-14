@@ -33,7 +33,7 @@ public class AirConditionerService {
         RoomInfo room = roomInfoMapper.findById(roomNumber)
                 .orElseThrow(() -> new IllegalStateException("Room " + roomNumber + " not found."));
 
-        if (room.getAcState() == STATE_ON) {
+        if (room.getAcState() == STATE_ON || room.getAcState() == 2) {
             return;
         }
 
